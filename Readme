@@ -1,0 +1,5 @@
+# WeCom Callback Server (minimal)
+
+## 1) Install
+```bash
+npm install
