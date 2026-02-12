@@ -49,6 +49,14 @@ app.get("/wecom/callback", (req, res) => {
       return res.status(200).send("ok");
     }
 
+app.get("/", (req, res) => {
+  res.status(200).send("ok");
+});
+
+app.get("/health", (req, res) => {
+  res.status(200).send("ok");
+});
+   
     // verify signature and decrypt echostr
     const plainEcho = cryptoHelper.verifyUrl({
       msgSignature: String(msg_signature),
@@ -138,8 +146,13 @@ app.post("/wecom/callback", async (req, res) => {
   }
 });
 
+
 app.listen(Number(PORT), "0.0.0.0", () => {
   console.log(`WeCom callback server listening on port ${PORT}`);
   console.log("Callback URL path: /wecom/callback");
 });
 
+
+app.listen(Number(PORT), "0.0.0.0", () => {
+  console.log(`Server running on port ${PORT}`);
+});
