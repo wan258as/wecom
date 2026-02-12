@@ -5,6 +5,7 @@ import { WeComCrypto } from "./wecomCrypto.js";
 
 dotenv.config();
 
+
 const {
   WECOM_CORP_ID,
   WECOM_TOKEN,
@@ -26,9 +27,17 @@ const cryptoHelper = new WeComCrypto({
 
 const app = express();
 
-// WeCom sends XML
-app.use(express.text({ type: ["text/xml", "application/xml", "*/*"], limit: "2mb" }));
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT EXCEPTION:", err);
+});
 
+process.on("unhandledRejection", (err) => {
+  console.error("UNHANDLED REJECTION:", err);
+});
+
+// WeCom sends XML
+// WeCom sends XML (often Content-Type: text/xml or application/xml)
+app.use(express.text({ type: ["text/xml", "application/xml"], limit: "2mb" }));
 app.get("/health", (req, res) => {
   res.status(200).send("ok");
 });
@@ -104,7 +113,18 @@ app.post("/wecom/callback", async (req, res) => {
     });
 
     console.log("\n==== Decrypted WeCom XML ====\n", decryptedXml, "\n============================\n");
+app.post("/wecom/callback", (req, res) => {
+  try {
+    console.log("POST query:", req.query);
+    console.log("POST body:", req.body);
 
+    // 先简单返回 success，防止企业微信重试
+    return res.status(200).send("success");
+  } catch (err) {
+    console.error(err);
+    return res.status(200).send("success");
+  }
+});
     // Parse decrypted message for optional auto-reply
     const inner = parseXmlToObj(decryptedXml);
     const msg = inner?.xml || {};
@@ -147,12 +167,11 @@ app.post("/wecom/callback", async (req, res) => {
 });
 
 
-app.listen(Number(PORT), "0.0.0.0", () => {
-  console.log(`WeCom callback server listening on port ${PORT}`);
-  console.log("Callback URL path: /wecom/callback");
-});
 
 
 app.listen(Number(PORT), "0.0.0.0", () => {
   console.log(`Server running on port ${PORT}`);
+});
+server.on("error", (err) => {
+  console.error("HTTP server error:", err);
 });
