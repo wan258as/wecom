@@ -14,6 +14,7 @@ const {
   WECOM_AGENT_ID = "1000003",
   OPENAI_API_KEY,
   PORT = "3000",
+  DEBUG_TOKEN,
 } = process.env;
 
 if (!WECOM_CORP_ID || !WECOM_TOKEN || !WECOM_AES_KEY) {
@@ -50,13 +51,13 @@ app.get("/health", (req, res) => res.status(200).send("ok"));
 
 /**
  * GET URL verification:
- * /wecom/callback?msg_signature=...&timestamp=...&nonce=...&Missing env var: WECOM_APP_SECRET (自建应用 secret)echostr=...
+ * /wecom/callback?msg_signature=...&timestamp=...&nonce=...&echostr=...
  */
 app.get("/wecom/callback", (req, res) => {
   try {
     const { msg_signature, timestamp, nonce, echostr } = req.query;
 
-    // 允许空 GET 做连通性测试
+    // allow empty GET for connectivity test
     if (!msg_signature || !timestamp || !nonce || !echostr) {
       return res.status(200).send("ok");
     }
@@ -71,7 +72,6 @@ app.get("/wecom/callback", (req, res) => {
     return res.status(200).send(plainEcho);
   } catch (err) {
     console.error("GET /wecom/callback error:", err?.message || err);
-    // 别返回 500，避免企业微信当成不可用
     return res.status(200).send("fail");
   }
 });
@@ -86,7 +86,9 @@ async function getWecomAccessToken() {
   }
 
   const url =
-    `https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=${encodeURIComponent(WECOM_CORP_ID)}&corpsecret=${encodeURIComponent(WECOM_APP_SECRET)}`;
+    `https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=${encodeURIComponent(
+      WECOM_CORP_ID
+    )}&corpsecret=${encodeURIComponent(WECOM_APP_SECRET)}`;
 
   const r = await fetch(url);
   const j = await r.json();
@@ -102,7 +104,9 @@ async function getWecomAccessToken() {
 
 async function sendWecomText(toUser, content) {
   const token = await getWecomAccessToken();
-  const url = `https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${encodeURIComponent(token)}`;
+  const url = `https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${encodeURIComponent(
+    token
+  )}`;
 
   const body = {
     touser: toUser,
@@ -131,7 +135,6 @@ async function sendWecomText(toUser, content) {
  * body: <xml><Encrypt>...</Encrypt></xml>
  */
 app.post("/wecom/callback", async (req, res) => {
-  // 先尽量拿到 query / body，即使后面失败也别让企业微信一直重试
   const { msg_signature, timestamp, nonce } = req.query;
   const rawXml = req.body || "";
 
@@ -146,7 +149,7 @@ app.post("/wecom/callback", async (req, res) => {
     const outer = parseXmlToObj(rawXml);
     const encrypt = outer?.xml?.Encrypt;
 
-    // 解密（如果没有 Encrypt，当作明文兼容）
+    // decrypt if needed
     let decryptedXml = "";
     if (encrypt) {
       decryptedXml = cryptoHelper.decryptMessage({
@@ -162,36 +165,40 @@ app.post("/wecom/callback", async (req, res) => {
     const inner = parseXmlToObj(decryptedXml);
     const msg = inner?.xml || {};
 
-    console.log("\n==== Incoming WeCom XML (decrypted/plain) ====\n", decryptedXml, "\n============================================\n");
+    console.log(
+      "\n==== Incoming WeCom XML (decrypted/plain) ====\n",
+      decryptedXml,
+      "\n============================================\n"
+    );
 
-    // 只处理文本消息
     const msgType = msg.MsgType;
     const fromUser = msg.FromUserName;
     const content = (msg.Content || "").trim();
 
-    // ✅ 立刻 ACK，避免 5 秒超时重试
+    // ✅ ACK immediately to avoid retries
     res.status(200).send("success");
 
-    // 异步处理（不要 await 卡住回调）
+    // async handle
     (async () => {
       try {
         if (msgType !== "text" || !fromUser || !content) return;
 
-        const completion = await openai.chat.completions.create({
-          model: "gpt-3.5-turbo",
-          messages: [{ role: "user", content }],
-});
-
-const reply =
-  (completion.choices?.[0]?.message?.content || "").trim() || "（我暂时没有生成出回复）";
-
+        // ✅ use a stable model that you have in /v1/models
+        const aiResp = await openai.responses.create({
+          model: "gpt-4o-mini",
+          input: content,
+        });
 
         const reply = (aiResp.output_text || "").trim() || "（我暂时没有生成出回复）";
         const safeReply = reply.length > 1800 ? reply.slice(0, 1800) + "…" : reply;
 
         await sendWecomText(fromUser, safeReply);
       } catch (e) {
-        console.error("Async AI/send error:", e?.message || e);
+        // log full OpenAI error
+        console.error("Async AI/send error status:", e?.status);
+        console.error("Async AI/send error message:", e?.message);
+        console.error("Async AI/send error body:", e?.error || e?.response?.data || e);
+
         try {
           if (fromUser) {
             await sendWecomText(fromUser, "抱歉，我刚刚出了一点问题，稍后再试一次。");
@@ -203,8 +210,6 @@ const reply =
     return;
   } catch (err) {
     console.error("POST /wecom/callback error:", err?.message || err);
-
-    // 尽量 ACK，避免企业微信狂重试
     try {
       return res.status(200).send("success");
     } catch {
@@ -212,22 +217,21 @@ const reply =
     }
   }
 });
+
+// Debug endpoint (remove after testing)
 app.get("/debug-openai", async (req, res) => {
-  if (req.query.token !== process.env.DEBUG_TOKEN) {
+  if (!DEBUG_TOKEN || req.query.token !== DEBUG_TOKEN) {
     return res.status(403).send("Forbidden");
   }
 
   try {
     const response = await fetch("https://api.openai.com/v1/models", {
       method: "GET",
-      headers: {
-        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
-      },
+      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
     });
 
     const text = await response.text();
     res.status(response.status).send(text);
-
   } catch (error) {
     res.status(500).send(String(error));
   }
