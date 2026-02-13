@@ -178,7 +178,7 @@ app.post("/wecom/callback", async (req, res) => {
         if (msgType !== "text" || !fromUser || !content) return;
 
         const aiResp = await openai.responses.create({
-          model: "gpt-5-mini",
+          model: "gpt-4o-mini",
           input: content,
         });
 
