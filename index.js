@@ -50,7 +50,7 @@ app.get("/health", (req, res) => res.status(200).send("ok"));
 
 /**
  * GET URL verification:
- * /wecom/callback?msg_signature=...&timestamp=...&nonce=...&echostr=...
+ * /wecom/callback?msg_signature=...&timestamp=...&nonce=...&Missing env var: WECOM_APP_SECRET (自建应用 secret)echostr=...
  */
 app.get("/wecom/callback", (req, res) => {
   try {
@@ -206,6 +206,26 @@ app.post("/wecom/callback", async (req, res) => {
     } catch {
       return;
     }
+  }
+});
+app.get("/debug-openai", async (req, res) => {
+  if (req.query.token !== process.env.DEBUG_TOKEN) {
+    return res.status(403).send("Forbidden");
+  }
+
+  try {
+    const response = await fetch("https://api.openai.com/v1/models", {
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
+    });
+
+    const text = await response.text();
+    res.status(response.status).send(text);
+
+  } catch (error) {
+    res.status(500).send(String(error));
   }
 });
 
