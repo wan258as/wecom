@@ -1,72 +1,66 @@
 import express from "express";
 import dotenv from "dotenv";
-import { parseXmlToObj, buildXml } from "./xml.js";
+import OpenAI from "openai";
+import { parseXmlToObj } from "./xml.js";
 import { WeComCrypto } from "./wecomCrypto.js";
 
 dotenv.config();
-
 
 const {
   WECOM_CORP_ID,
   WECOM_TOKEN,
   WECOM_AES_KEY,
+  WECOM_APP_SECRET,
+  WECOM_AGENT_ID = "1000003",
+  OPENAI_API_KEY,
   PORT = "3000",
-  AUTO_REPLY_TEXT = "false"
 } = process.env;
 
 if (!WECOM_CORP_ID || !WECOM_TOKEN || !WECOM_AES_KEY) {
-  console.error("Missing env vars. Please set WECOM_CORP_ID, WECOM_TOKEN, WECOM_AES_KEY");
+  console.error("Missing env vars: WECOM_CORP_ID, WECOM_TOKEN, WECOM_AES_KEY");
+  process.exit(1);
+}
+if (!WECOM_APP_SECRET) {
+  console.error("Missing env var: WECOM_APP_SECRET (自建应用 secret)");
+  process.exit(1);
+}
+if (!OPENAI_API_KEY) {
+  console.error("Missing env var: OPENAI_API_KEY");
   process.exit(1);
 }
 
 const cryptoHelper = new WeComCrypto({
   corpId: WECOM_CORP_ID,
   token: WECOM_TOKEN,
-  encodingAesKey: WECOM_AES_KEY
+  encodingAesKey: WECOM_AES_KEY,
 });
+
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 const app = express();
 
-process.on("uncaughtException", (err) => {
-  console.error("UNCAUGHT EXCEPTION:", err);
-});
+// WeCom sends XML (text/xml or application/xml)
+app.use(express.text({ type: ["text/xml", "application/xml", "*/*"], limit: "2mb" }));
 
-process.on("unhandledRejection", (err) => {
-  console.error("UNHANDLED REJECTION:", err);
-});
+process.on("uncaughtException", (err) => console.error("UNCAUGHT EXCEPTION:", err));
+process.on("unhandledRejection", (err) => console.error("UNHANDLED REJECTION:", err));
 
-// WeCom sends XML
-// WeCom sends XML (often Content-Type: text/xml or application/xml)
-app.use(express.text({ type: ["text/xml", "application/xml"], limit: "2mb" }));
-app.get("/health", (req, res) => {
-  res.status(200).send("ok");
-});
+app.get("/", (req, res) => res.status(200).send("ok"));
+app.get("/health", (req, res) => res.status(200).send("ok"));
 
 /**
- * Callback endpoint (set this URL in WeCom console):
- *   https://YOUR_DOMAIN/wecom/callback
- *
- * WeCom URL verification uses GET with:
- *   msg_signature, timestamp, nonce, echostr
+ * GET URL verification:
+ * /wecom/callback?msg_signature=...&timestamp=...&nonce=...&echostr=...
  */
 app.get("/wecom/callback", (req, res) => {
   try {
     const { msg_signature, timestamp, nonce, echostr } = req.query;
 
-    // ✅ 空GET / 缺参数：也返回200，方便连通性测试 & 避免WeCom误判
+    // 允许空 GET 做连通性测试
     if (!msg_signature || !timestamp || !nonce || !echostr) {
       return res.status(200).send("ok");
     }
 
-app.get("/", (req, res) => {
-  res.status(200).send("ok");
-});
-
-app.get("/health", (req, res) => {
-  res.status(200).send("ok");
-});
-   
-    // verify signature and decrypt echostr
     const plainEcho = cryptoHelper.verifyUrl({
       msgSignature: String(msg_signature),
       timestamp: String(timestamp),
@@ -74,104 +68,148 @@ app.get("/health", (req, res) => {
       echoStr: String(echostr),
     });
 
-    // IMPORTANT: return plaintext exactly
     return res.status(200).send(plainEcho);
   } catch (err) {
     console.error("GET /wecom/callback error:", err?.message || err);
-    // ✅ 建议这里也返回200，避免企业微信把“异常”当成“连不上”
+    // 别返回 500，避免企业微信当成不可用
     return res.status(200).send("fail");
   }
 });
 
+// --------------------- WeCom access_token cache ---------------------
+let tokenCache = { token: null, expireAt: 0 };
 
+async function getWecomAccessToken() {
+  const now = Date.now();
+  if (tokenCache.token && now < tokenCache.expireAt - 60_000) {
+    return tokenCache.token;
+  }
+
+  const url =
+    `https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=${encodeURIComponent(WECOM_CORP_ID)}&corpsecret=${encodeURIComponent(WECOM_APP_SECRET)}`;
+
+  const r = await fetch(url);
+  const j = await r.json();
+
+  if (j.errcode !== 0) {
+    throw new Error(`gettoken failed: ${j.errcode} ${j.errmsg}`);
+  }
+
+  tokenCache.token = j.access_token;
+  tokenCache.expireAt = now + (j.expires_in || 7200) * 1000;
+  return tokenCache.token;
+}
+
+async function sendWecomText(toUser, content) {
+  const token = await getWecomAccessToken();
+  const url = `https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${encodeURIComponent(token)}`;
+
+  const body = {
+    touser: toUser,
+    msgtype: "text",
+    agentid: Number(WECOM_AGENT_ID),
+    text: { content },
+    safe: 0,
+  };
+
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  const j = await r.json();
+  if (j.errcode !== 0) {
+    throw new Error(`message/send failed: ${j.errcode} ${j.errmsg}`);
+  }
+}
+
+// --------------------- POST callback ---------------------
 /**
- * WeCom message/event push uses POST:
- * Query: msg_signature, timestamp, nonce
- * Body: <xml><Encrypt>...</Encrypt></xml>
+ * POST message push:
+ * /wecom/callback?msg_signature=...&timestamp=...&nonce=...
+ * body: <xml><Encrypt>...</Encrypt></xml>
  */
 app.post("/wecom/callback", async (req, res) => {
-  try {
-    const { msg_signature, timestamp, nonce } = req.query;
+  // 先尽量拿到 query / body，即使后面失败也别让企业微信一直重试
+  const { msg_signature, timestamp, nonce } = req.query;
+  const rawXml = req.body || "";
 
+  try {
     if (!msg_signature || !timestamp || !nonce) {
       return res.status(400).send("Missing query params");
     }
-
-    const rawXml = req.body || "";
-    if (!rawXml.trim()) return res.status(400).send("Empty body");
+    if (!rawXml.trim()) {
+      return res.status(400).send("Empty body");
+    }
 
     const outer = parseXmlToObj(rawXml);
     const encrypt = outer?.xml?.Encrypt;
-    if (!encrypt) return res.status(400).send("Missing Encrypt in XML body");
 
-    // Verify + decrypt
-    const decryptedXml = cryptoHelper.decryptMessage({
-      msgSignature: String(msg_signature),
-      timestamp: String(timestamp),
-      nonce: String(nonce),
-      encrypt: String(encrypt)
-    });
-
-    console.log("\n==== Decrypted WeCom XML ====\n", decryptedXml, "\n============================\n");
-app.post("/wecom/callback", (req, res) => {
-  try {
-    console.log("POST query:", req.query);
-    console.log("POST body:", req.body);
-
-    // 先简单返回 success，防止企业微信重试
-    return res.status(200).send("success");
-  } catch (err) {
-    console.error(err);
-    return res.status(200).send("success");
-  }
-});
-    // Parse decrypted message for optional auto-reply
-    const inner = parseXmlToObj(decryptedXml);
-    const msg = inner?.xml || {};
-    const msgType = msg.MsgType;
-
-    // Default: return "success" quickly (recommended)
-    const shouldAutoReply = String(AUTO_REPLY_TEXT).toLowerCase() === "true";
-
-    if (!shouldAutoReply || msgType !== "text") {
-      return res.status(200).send("success");
+    // 解密（如果没有 Encrypt，当作明文兼容）
+    let decryptedXml = "";
+    if (encrypt) {
+      decryptedXml = cryptoHelper.decryptMessage({
+        msgSignature: String(msg_signature),
+        timestamp: String(timestamp),
+        nonce: String(nonce),
+        encrypt: String(encrypt),
+      });
+    } else {
+      decryptedXml = rawXml;
     }
 
-    // --- Optional auto-reply for text messages ---
-    const toUser = msg.FromUserName; // the sender
-    const fromUser = msg.ToUserName; // your corp/app/service
-    const content = msg.Content || "";
+    const inner = parseXmlToObj(decryptedXml);
+    const msg = inner?.xml || {};
 
-    const replyText = `收到：${content}`;
+    console.log("\n==== Incoming WeCom XML (decrypted/plain) ====\n", decryptedXml, "\n============================================\n");
 
-    const replyPlainXml = buildXml({
-      ToUserName: toUser,
-      FromUserName: fromUser,
-      CreateTime: Math.floor(Date.now() / 1000),
-      MsgType: "text",
-      Content: replyText
-    });
+    // 只处理文本消息
+    const msgType = msg.MsgType;
+    const fromUser = msg.FromUserName;
+    const content = (msg.Content || "").trim();
 
-    // Encrypt reply and sign
-    const encryptedReply = cryptoHelper.encryptMessage({
-      replyXml: replyPlainXml,
-      nonce: String(nonce),
-      timestamp: String(timestamp)
-    });
+    // ✅ 立刻 ACK，避免 5 秒超时重试
+    res.status(200).send("success");
 
-    return res.status(200).type("application/xml").send(encryptedReply);
+    // 异步处理（不要 await 卡住回调）
+    (async () => {
+      try {
+        if (msgType !== "text" || !fromUser || !content) return;
+
+        const aiResp = await openai.responses.create({
+          model: "gpt-5-mini",
+          input: content,
+        });
+
+        const reply = (aiResp.output_text || "").trim() || "（我暂时没有生成出回复）";
+        const safeReply = reply.length > 1800 ? reply.slice(0, 1800) + "…" : reply;
+
+        await sendWecomText(fromUser, safeReply);
+      } catch (e) {
+        console.error("Async AI/send error:", e?.message || e);
+        try {
+          if (fromUser) {
+            await sendWecomText(fromUser, "抱歉，我刚刚出了一点问题，稍后再试一次。");
+          }
+        } catch {}
+      }
+    })();
+
+    return;
   } catch (err) {
     console.error("POST /wecom/callback error:", err?.message || err);
-    return res.status(500).send("fail");
+
+    // 尽量 ACK，避免企业微信狂重试
+    try {
+      return res.status(200).send("success");
+    } catch {
+      return;
+    }
   }
 });
 
-
-
-
-app.listen(Number(PORT), "0.0.0.0", () => {
-  console.log(`Server running on port ${PORT}`);
-});
-server.on("error", (err) => {
-  console.error("HTTP server error:", err);
+const portNum = Number(PORT || 3000);
+app.listen(portNum, "0.0.0.0", () => {
+  console.log(`WeCom callback server listening on port ${portNum}`);
 });
