@@ -177,10 +177,14 @@ app.post("/wecom/callback", async (req, res) => {
       try {
         if (msgType !== "text" || !fromUser || !content) return;
 
-        const aiResp = await openai.responses.create({
+        const completion = await openai.chat.completions.create({
           model: "gpt-3.5-turbo",
-          input: content,
-        });
+          messages: [{ role: "user", content }],
+});
+
+const reply =
+  (completion.choices?.[0]?.message?.content || "").trim() || "（我暂时没有生成出回复）";
+
 
         const reply = (aiResp.output_text || "").trim() || "（我暂时没有生成出回复）";
         const safeReply = reply.length > 1800 ? reply.slice(0, 1800) + "…" : reply;
